@@ -5,44 +5,51 @@ Created on Thursday, July 1, 22:42:05 GMT+5, 2021.
 @author: Camilo Martínez
 @location: Barranquilla, Colombia
 """
+import re
 from functools import reduce
+import Levenshtein
+from difflib import SequenceMatcher
 
 from bs4 import BeautifulSoup
 from requests import HTTPError, Session, get
 
-from utils.log import Logger
-from dotenv import dotenv_values
-
-# Constant that defines the maximum number of critics to store.
-MAX_NUMBER_OF_CRITICS = 2
+from movies_advisor.utils.log import Logger
 
 # Filmaffinity root URL
-FILMAFFINITY_URL_ROOT = "https://www.filmaffinity.com/co/search.php?stext="
+FILMAFFINITY_URL_ROOT = "https://www.filmaffinity.com/en/search.php?stext="
 
 # IMDB sign-in URL
 IMDB_SIGNIN_URL = "https://www.imdb.com/registration/signin?u=/"
 
-# Load IMDB credentials
-config = dotenv_values("credentials.env")
-
-
 class MoviesFinder:
-    """ Handles the parsing of the websites necessary to get the movies.
-
+    """Handles the parsing of the websites necessary to get the movies."""
+    def __init__(self, movies: dict, imdb_credentials: dict, number_critics: int = 2):
+        """
         Parameters
         ----------
         movies : dict
-            Url to start with. Usually: Fandango website.
-    """
-
-    def __init__(self, movies: str) -> object:
+            Movies whose complete information will be found, where the key is
+            the name and the value is the year.
+        imdb_credentials: dict
+            IMDB credentials to sign in. Keys = {'email', 'password'}.
+        number_critics: int, optional
+            Constant that defines the maximum number of critics to store.
+            By default, 2.
+        """
         self.movies = movies
+        self.number_critics = number_critics
+        self.imdb_credentials = imdb_credentials
         self._info = dict()
         self._logger = Logger()
 
-    def complete_information(self):
-        """ Constructs a dictionary with the complete information of 
-            each movie. """
+    def complete_information(self, verbose: bool = False) -> None:
+        """Completes the information of each movie.
+        
+        Parameters
+        ----------
+            verbose : bool, optional
+                By default, False.
+        """
         self._info = {
             movie_name: dict() for movie_name in self.movies
         }
@@ -50,33 +57,39 @@ class MoviesFinder:
         # For each movie, this will fill the previous dictionary with the
         # complete information taken from Film Affinity and IMDb.
         for movie, year in self.movies.items():
+            if verbose:
+                print(f"Completing {movie} ({year})... ", end="")
+                
             self.get_useful_information_from_filmaffinity(movie, year)
             original_name = self._info[movie]["original name"].lower()
             self.get_useful_information_from_imdb(movie, original_name, year)
+            
+            if verbose:
+                print("Done")
 
     def get_useful_information_from_filmaffinity(self, movie_name: str,
                                                  movie_year: str) -> dict:
-        """ Gets the original name of the movie, synopsis and critics.
+        """Gets the original name of the movie, synopsis and critics.
 
-            This useful information is stored in a dictionary, where the key 
-            is the name of the movie and its value is another dictionary, 
-            which contains the folowing values: original name, year, synopsis,
-            critics, tomatometer and audience score. The synopsis is a string 
-            and the critics is a list of strings. 
+        This useful information is stored in a dictionary, where the key 
+        is the name of the movie and its value is another dictionary, 
+        which contains the folowing values: original name, year, synopsis,
+        critics, tomatometer and audience score. The synopsis is a string 
+        and the critics is a list of strings. 
 
-            Information provider: Film Affinity.
+        Information provider: Film Affinity.
 
-            Parameters
-            ----------
-            movie_name : str
-                Name of the movie in theaters (probably in spanish).
-            movie_year : str
-                Release year of the movie.
+        Parameters
+        ----------
+        movie_name : str
+            Name of the movie in theaters (probably in spanish).
+        movie_year : str
+            Release year of the movie.
 
-            Returns
-            -------
-            useful_information : dict
-                Useful information regarding the movie.
+        Returns
+        -------
+        useful_information : dict
+            Useful information regarding the movie.
         """
         url_root = FILMAFFINITY_URL_ROOT
 
@@ -94,7 +107,7 @@ class MoviesFinder:
         ) if len(movie_name_words) > 1 else movie_name_words[0]
 
         url = url_root + parsed_movie_name + "&stype=all"  # Actual URL
-
+        
         soup = self.soup_from_url(url)
 
         # SCRAPING AND CONSTRUCTION OF DICTIONARY
@@ -157,15 +170,15 @@ class MoviesFinder:
             critics = [
                 self.clean_string(critics_tag.text.strip())
                 for index, critics_tag in enumerate(critics_tags)
-                if index < MAX_NUMBER_OF_CRITICS
+                if index < self.number_critics
             ]
 
             critics = [critic + "."
                        if not critic.endswith(".") else critic
                        for critic in critics]
 
-            critics = [critic.split("Puntuación")[0].strip()
-                       if "Puntuación" in critic else critic
+            critics = [critic.split("Rating")[0].strip()
+                       if "Rating" in critic else critic
                        for critic in critics]
         else:  # In case the list is empty.
             critics = None
@@ -175,9 +188,9 @@ class MoviesFinder:
         d = {
             "original name": original_name,
             "year": year,
-            "Synopsis": synopsis,
+            "synopsis": synopsis,
             "critics": critics,
-            "imdb rating": None
+            "imdb_rating": None
         }
 
         self._info[movie_name] = d
@@ -255,10 +268,10 @@ class MoviesFinder:
                         "itemprop": "ratingValue"
                     }).text.strip()
                     self._info[movie_name][
-                        "imdb rating"] = imdb_rating
+                        "imdb_rating"] = imdb_rating
                     return
             except Exception as e:
-                self.log_error(str(e))
+                self._logger.log(str(e))
 
     def clean_string(self, string: str) -> str:
         """ Cleans the given string.
@@ -279,7 +292,7 @@ class MoviesFinder:
             string.replace('"', " ")
             .replace("'", " ")
             .replace("',", ", ")
-            .replace("'", " ")
+            .replace("'", "")
             .replace(" (...) ", ". ")
             .replace(" (…) ", ". ")
             .replace("“", "")
@@ -315,45 +328,30 @@ class MoviesFinder:
             year : str
                 Release year.
         """
-        cont = 0
-        found_year = False
         possible_year = ""
-        for char in string:
-            if found_year:
+        inside_parentheses = re.findall('\(.*?\)', string)
+        for stuff in inside_parentheses:
+            if stuff[1:-1].isdigit():
+                possible_year = stuff[1:-1]
                 break
-
-            if char == "(":
-                for char_1 in string[cont + 1:]:
-                    if char_1 == ")":
-                        try:
-                            int(possible_year)
-                            found_year = True
-                        except:
-                            possible_year = ""
-                        break
-                    else:
-                        possible_year += char_1
-            else:
-                cont += 1
 
         return possible_year
 
-    def soup_from_url(self, url: str, s=None) -> object:
+    def soup_from_url(self, url: str, s: Session = None) -> object:
         """ Gets the BeautifulSoup object from a url using the requests module.
 
-            Headers are used for avoiding the error "exceeded 30 redirects".
+        Headers are used for avoiding the error "exceeded 30 redirects".
 
-            Parameters
-            ----------
-            url : str
-                URL to get the BeautifulSoup object from.
+        Parameters
+        ----------
+        url : str
+            URL to get the BeautifulSoup object from.
+        s : requests.Session
+            Current session. Its default value is None.
 
-            s : requests.Session
-                Current session. Its default value is none.
-
-            Returns
-            -------
-            soup : BeautifulSoup object
+        Returns
+        -------
+        soup : BeautifulSoup object
         """
         headers = {
             'Accept-Encoding': 'gzip, deflate, sdch',
@@ -381,13 +379,13 @@ class MoviesFinder:
         soup = BeautifulSoup(res.text, features="html.parser")
         return soup
 
-    def sign_in_to_imdb(self) -> object:
-        """ Signs in to IMDb using the appropiate credentials.
+    def sign_in_to_imdb(self) -> Session:
+        """Signs in to IMDb using the appropiate credentials.
 
-            Returns
-            -------
-            s : requests.Session
-                Current session.
+        Returns
+        -------
+        s : requests.Session
+            Current session.
         """
         signin_url = IMDB_SIGNIN_URL
         soup = self.soup_from_url(signin_url)
@@ -400,41 +398,42 @@ class MoviesFinder:
         s = Session()
 
         login_data = {
-            'email': config["IMDB_EMAIL"],
-            'password': config["IMDB_PASSWORD"]
+            'email': self.imdb_credentials["email"],
+            'password': self.imdb_credentials["password"]
         }
 
         s.post(signin_IMDB_url, data=login_data)
         return s
 
-    def title_is_accurate(self, title: str, original_title: str) -> bool:
-        """ Checks if the title is accurate according to the original title.
+    def title_is_accurate(self, title: str, original_title: str,
+                          use_levenshtein: bool = True) -> bool:
+        """Checks if the title is accurate according to the original title.
 
-            The accuracy is defined as the ratio of words in title that are in
-            the original title. If it is greater than or equal to 90%, the 
-            given title is considered to be "accurate".
+        The accuracy is defined as the ratio of words in title that are in
+        the original title. If it is greater than or equal to 90%, the 
+        given title is considered to be "accurate".
 
-            Parameters
-            ----------
-            title : str
-                The title to which its accuracy will be calculated.
-            original_title : str
-                Original title of the movie.
+        Parameters
+        ----------
+        title : str
+            The title to which its accuracy will be calculated.
+        original_title : str
+            Original title of the movie.
+        use_levenshtein: bool, optional
+            Whether to use Levenshtein distance or Python's built-in
+            Sequence matcher. By default, True.
 
-            Returns
-            -------
-            accuracy : float
-                Accuracy of the given title. Float number between 0 and 1.0
+        Returns
+        -------
+        accuracy : float
+            Accuracy of the given title. Float number between 0 and 1.0
         """
-        count = 0
-        words_in_original_title = [word.lower() for word in title.split(" ")]
+        if use_levenshtein:
+            similarity = Levenshtein.ratio(title, original_title)
+        else:
+            similarity = SequenceMatcher(None, title, original_title).ratio()
 
-        for word in words_in_original_title:
-            if word in original_title.lower():
-                count += 1
-
-        accuracy = float(count/len(original_title.split(" ")))
-        if accuracy >= 0.9:
+        if similarity >= 0.9:
             return True
         else:
             return False
